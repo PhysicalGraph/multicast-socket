@@ -1,7 +1,8 @@
-use multicast_socket::MulticastSocket;
-use std::net::SocketAddrV4;
+use multicast_socket::{AsyncMulticastSocket, MulticastSocket};
+use std::{convert::TryInto, net::SocketAddrV4};
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let mdns_multicast_address = SocketAddrV4::new([224, 0, 0, 251].into(), 5353);
 
     // Validate that building with options works with the public API
@@ -16,24 +17,27 @@ fn main() {
     .expect("validate that we are starting with options");
     drop(with_options);
 
-    let mut socket = MulticastSocket::all_interfaces(mdns_multicast_address)
-        .expect("could not create and bind socket");
+    let socket =
+        MulticastSocket::all_interfaces(mdns_multicast_address).expect("could not create socket");
 
-    socket.bind().expect("Could not bind");
+    let async_socket: AsyncMulticastSocket =
+        socket.try_into().expect("Couldn't convert to async socket");
 
     let data = vec![1, 2];
-    socket
+    async_socket
         .broadcast(&data)
+        .await
         .expect("could not broadcast message to ips being listened");
 
     loop {
-        if let Ok(message) = socket.receive() {
+        if let Ok(message) = async_socket.receive().await {
             dbg!(&message.interface);
             dbg!(&message.origin_address);
 
             let data = vec![9, 8, 7];
-            socket
+            async_socket
                 .send(&data, &message.interface)
+                .await
                 .expect("could not send data");
         };
     }

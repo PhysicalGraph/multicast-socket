@@ -6,6 +6,11 @@ use std::os::unix::io::AsRawFd;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
+#[cfg(feature = "tokio")]
+use std::convert::TryFrom;
+#[cfg(feature = "tokio")]
+use tokio::io::Interest;
+
 use nix::sys::socket as sock;
 use nix::sys::uio::IoVec;
 
@@ -27,24 +32,31 @@ fn create_on_interfaces(
         .map_err(nix_to_io_error)?;
 
     for interface in &interfaces {
+        println!("Joining multicast addr {multicast_address:#?} for iface {interface:#?}");
         socket.join_multicast_v4(multicast_address.ip(), &interface)?;
     }
 
-    socket.bind(&SocketAddr::new(options.bind_address.into(), multicast_address.port()).into())?;
-
     Ok(MulticastSocket {
         socket,
-        interfaces,
-        multicast_address,
-        buffer_size: options.buffer_size,
+        inner: MulticastSocketInner {
+            interfaces,
+            multicast_address,
+            buffer_size: options.buffer_size,
+            options: Some(options),
+        },
     })
+}
+
+struct MulticastSocketInner {
+    interfaces: Vec<Ipv4Addr>,
+    multicast_address: SocketAddrV4,
+    buffer_size: usize,
+    options: Option<crate::MulticastOptions>,
 }
 
 pub struct MulticastSocket {
     socket: socket2::Socket,
-    interfaces: Vec<Ipv4Addr>,
-    multicast_address: SocketAddrV4,
-    buffer_size: usize,
+    inner: MulticastSocketInner,
 }
 
 #[derive(Debug, Clone)]
@@ -134,8 +146,22 @@ fn nix_to_io_error(e: nix::Error) -> io::Error {
 }
 
 impl MulticastSocket {
+    pub fn bind(&mut self) -> io::Result<()> {
+        let options =
+            self.inner.options.take().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::AlreadyExists, "Socket already bound")
+            })?;
+        self.socket.bind(
+            &SocketAddr::new(
+                options.bind_address.into(),
+                self.inner.multicast_address.port(),
+            )
+            .into(),
+        )
+    }
+
     pub fn receive(&self) -> io::Result<Message> {
-        let mut data_buffer = vec![0; self.buffer_size];
+        let mut data_buffer = vec![0; self.inner.buffer_size];
         let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
 
         let message = sock::recvmsg(
@@ -170,7 +196,12 @@ impl MulticastSocket {
         })
     }
 
-    pub fn send(&self, buf: &[u8], interface: &Interface) -> io::Result<usize> {
+    pub fn send_to(
+        &self,
+        buf: &[u8],
+        interface: &Interface,
+        addr: SocketAddrV4,
+    ) -> io::Result<usize> {
         let mut pkt_info: libc::in_pktinfo = unsafe { mem::zeroed() };
 
         match interface {
@@ -179,7 +210,7 @@ impl MulticastSocket {
             Interface::Index(index) => pkt_info.ipi_ifindex = *index as _,
         };
 
-        let destination = sock::InetAddr::from_std(&self.multicast_address.into());
+        let destination = sock::InetAddr::from_std(&addr.into());
 
         sock::sendmsg(
             self.socket.as_raw_fd(),
@@ -191,10 +222,143 @@ impl MulticastSocket {
         .map_err(nix_to_io_error)
     }
 
-    pub fn broadcast(&self, buf: &[u8]) -> io::Result<()> {
-        for interface in &self.interfaces {
-            self.send(buf, &Interface::Ip(*interface))?;
+    pub fn send(&self, buf: &[u8], interface: &Interface) -> io::Result<usize> {
+        self.send_to(buf, interface, self.inner.multicast_address)
+    }
+
+    pub fn broadcast_to(&self, buf: &[u8], addr: SocketAddrV4) -> io::Result<()> {
+        for interface in &self.inner.interfaces {
+            println!("Sending to interface {interface:#?}");
+            self.send_to(buf, &Interface::Ip(*interface), addr)?;
         }
         Ok(())
+    }
+
+    pub fn broadcast(&self, buf: &[u8]) -> io::Result<()> {
+        self.broadcast_to(buf, self.inner.multicast_address)
+    }
+}
+
+#[cfg(feature = "tokio")]
+pub struct AsyncMulticastSocket {
+    socket: tokio::net::UdpSocket,
+    inner: MulticastSocketInner,
+}
+
+/// Converts this socket in to one with an `async` API.
+/// This will call `bind` on the socket if it has not already
+/// been bound.
+#[cfg(feature = "tokio")]
+impl TryFrom<MulticastSocket> for AsyncMulticastSocket {
+    type Error = io::Error;
+
+    fn try_from(value: MulticastSocket) -> Result<Self, Self::Error> {
+        let mut other = value;
+        other.inner.options = other.inner.options.map(|mut opts| {
+            opts.read_timeout = None;
+            opts
+        });
+        other.socket.set_nonblocking(true)?;
+        other.bind()?;
+
+        let sock = tokio::net::UdpSocket::from_std(other.socket.into())?;
+
+        Ok(Self {
+            socket: sock,
+            inner: other.inner,
+        })
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncMulticastSocket {
+    pub async fn receive(&self) -> io::Result<Message> {
+        let mut data_buffer = vec![0; self.inner.buffer_size];
+        let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
+
+        // There is no Async API for the UNIX sendmsg/recvmsg vectored scatter-gather
+        // calls, and the multihome functionality relies on receiving that ancillary data,
+        // so we have to make this operation async "manually".
+        self.socket.readable().await?;
+        let message = self.socket.try_io(Interest::READABLE, || {
+            sock::recvmsg(
+                self.socket.as_raw_fd(),
+                &[IoVec::from_mut_slice(&mut data_buffer)],
+                Some(&mut control_buffer),
+                sock::MsgFlags::empty(),
+            )
+            .map_err(nix_to_io_error)
+        })?;
+
+        let origin_address = match message.address {
+            Some(sock::SockAddr::Inet(v4)) => Some(v4.to_std()),
+            _ => None,
+        };
+        let origin_address = match origin_address {
+            Some(SocketAddr::V4(v4)) => v4,
+            _ => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+        };
+
+        let mut interface = Interface::Default;
+
+        for cmsg in message.cmsgs() {
+            if let sock::ControlMessageOwned::Ipv4PacketInfo(pktinfo) = cmsg {
+                interface = Interface::Index(pktinfo.ipi_ifindex as _);
+            }
+        }
+
+        Ok(Message {
+            data: data_buffer[0..message.bytes].to_vec(),
+            origin_address,
+            interface,
+        })
+    }
+
+    pub async fn send_to(
+        &self,
+        buf: &[u8],
+        interface: &Interface,
+        addr: SocketAddrV4,
+    ) -> io::Result<usize> {
+        let mut pkt_info: libc::in_pktinfo = unsafe { mem::zeroed() };
+
+        match interface {
+            Interface::Default => {}
+            Interface::Ip(address) => pkt_info.ipi_spec_dst = sock::Ipv4Addr::from_std(address).0,
+            Interface::Index(index) => pkt_info.ipi_ifindex = *index as _,
+        };
+
+        let destination = sock::InetAddr::from_std(&addr.into());
+
+        // There is no Async API for the UNIX sendmsg/recvmsg vectored scatter-gather
+        // calls, and the multihome functionality relies on receiving that ancillary data,
+        // so we have to make this operation async "manually".
+        self.socket.writable().await?;
+        self.socket.try_io(Interest::WRITABLE, || {
+            sock::sendmsg(
+                self.socket.as_raw_fd(),
+                &[IoVec::from_slice(&buf)],
+                &[sock::ControlMessage::Ipv4PacketInfo(&pkt_info)],
+                sock::MsgFlags::empty(),
+                Some(&sock::SockAddr::new_inet(destination)),
+            )
+            .map_err(nix_to_io_error)
+        })
+    }
+    pub async fn send(&self, buf: &[u8], interface: &Interface) -> io::Result<usize> {
+        self.send_to(buf, interface, self.inner.multicast_address)
+            .await
+    }
+
+    pub async fn broadcast_to(&self, buf: &[u8], addr: SocketAddrV4) -> io::Result<()> {
+        for interface in &self.inner.interfaces {
+            println!("Sending to interface {interface:#?}");
+            self.send_to(buf, &Interface::Ip(*interface), addr).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn broadcast(&self, buf: &[u8]) -> io::Result<()> {
+        self.broadcast_to(buf, self.inner.multicast_address).await
     }
 }
