@@ -1,9 +1,12 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::IoSliceMut;
+use std::io::{self, IoSlice};
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
 
+use nix::net::if_::InterfaceFlags;
 use socket2::{Domain, Protocol, Socket, Type};
 
 #[cfg(feature = "tokio")]
@@ -11,15 +14,14 @@ use std::convert::TryFrom;
 #[cfg(feature = "tokio")]
 use tokio::io::Interest;
 
-use nix::sys::socket as sock;
-use nix::sys::uio::IoVec;
+use nix::sys::socket::{self as sock, RecvMsg};
 
 fn create_on_interfaces(
     options: crate::MulticastOptions,
     interfaces: Vec<Ipv4Addr>,
     multicast_address: SocketAddrV4,
 ) -> io::Result<MulticastSocket> {
-    let socket = Socket::new(Domain::ipv4(), Type::dgram(), Some(Protocol::udp()))?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_read_timeout(options.read_timeout)?;
     socket.set_multicast_loop_v4(options.loopback)?;
     socket.set_reuse_address(true)?;
@@ -28,7 +30,7 @@ fn create_on_interfaces(
     // Ipv4PacketInfo translates to `IP_PKTINFO`. Checkout the [ip
     // manpage](https://man7.org/linux/man-pages/man7/ip.7.html) for more details. In summary
     // setting this option allows for determining on which interface a packet was received.
-    sock::setsockopt(socket.as_raw_fd(), sock::sockopt::Ipv4PacketInfo, &true)
+    sock::setsockopt(&socket.as_fd(), sock::sockopt::Ipv4PacketInfo, &true)
         .map_err(nix_to_io_error)?;
 
     for interface in &interfaces {
@@ -104,22 +106,35 @@ fn reverse_address(v4: Ipv4Addr) -> Ipv4Addr {
 
 pub fn all_ipv4_interfaces() -> io::Result<Vec<Ipv4Addr>> {
     #[cfg(not(target_arch = "mips"))]
-    let interfaces = get_if_addrs::get_if_addrs()?.into_iter();
+    let interfaces = nix::ifaddrs::getifaddrs()
+        .map_err(nix_to_io_error)?
+        .into_iter();
     #[cfg(target_arch = "mips")]
-    let interfaces = get_if_addrs::get_if_addrs()?
+    let interfaces = nix::ifaddrs::getifaddrs()
+        .map_err(nix_to_io_error)?
         .into_iter()
         .map(reverse_interface);
 
     // We have to filter the same interface if it has multiple ips
     // https://stackoverflow.com/questions/49819010/ip-add-membership-fails-when-set-both-on-interface-and-its-subinterface-is-that
-    let mut collected_interfaces = HashMap::with_capacity(interfaces.len());
+    let (lower_bound, upper_bound) = interfaces.size_hint();
+    let reserved_capacity = if let Some(bound) = upper_bound {
+        bound
+    } else {
+        lower_bound
+    };
+    let mut collected_interfaces = HashMap::with_capacity(reserved_capacity);
     for interface in interfaces {
-        if !collected_interfaces.contains_key(&interface.name) {
-            match interface.ip() {
-                std::net::IpAddr::V4(v4) if !interface.is_loopback() => {
-                    collected_interfaces.insert(interface.name, v4);
+        if !collected_interfaces.contains_key(&interface.interface_name) {
+            if !interface.flags.contains(InterfaceFlags::IFF_LOOPBACK) {
+                if let Some(addr) = &interface.address {
+                    if let Some(sockaddr) = addr.as_sockaddr_in() {
+                        collected_interfaces.insert(
+                            interface.interface_name,
+                            std::net::Ipv4Addr::from(sockaddr.ip()),
+                        );
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -163,21 +178,21 @@ impl MulticastSocket {
     pub fn receive(&self) -> io::Result<Message> {
         let mut data_buffer = vec![0; self.inner.buffer_size];
         let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
+        let io_slice = &mut [IoSliceMut::new(&mut data_buffer)];
 
-        let message = sock::recvmsg(
+        let message: RecvMsg<sock::SockaddrIn> = sock::recvmsg(
             self.socket.as_raw_fd(),
-            &[IoVec::from_mut_slice(&mut data_buffer)],
+            io_slice,
             Some(&mut control_buffer),
             sock::MsgFlags::empty(),
         )
         .map_err(nix_to_io_error)?;
 
         let origin_address = match message.address {
-            Some(sock::SockAddr::Inet(v4)) => Some(v4.to_std()),
-            _ => None,
-        };
-        let origin_address = match origin_address {
-            Some(SocketAddr::V4(v4)) => v4,
+            Some(sockaddr) => SocketAddrV4::new(
+                Ipv4Addr::from(sockaddr.ip().to_le()),
+                sockaddr.port().to_le(),
+            ),
             _ => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
         };
 
@@ -189,8 +204,10 @@ impl MulticastSocket {
             }
         }
 
+        let data_as_vec = data_buffer.to_vec();
+
         Ok(Message {
-            data: data_buffer[0..message.bytes].to_vec(),
+            data: data_as_vec,
             origin_address,
             interface,
         })
@@ -206,18 +223,20 @@ impl MulticastSocket {
 
         match interface {
             Interface::Default => {}
-            Interface::Ip(address) => pkt_info.ipi_spec_dst = sock::Ipv4Addr::from_std(address).0,
+            Interface::Ip(address) => {
+                pkt_info.ipi_spec_dst = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(address.octets()),
+                }
+            }
             Interface::Index(index) => pkt_info.ipi_ifindex = *index as _,
         };
 
-        let destination = sock::InetAddr::from_std(&addr.into());
-
         sock::sendmsg(
             self.socket.as_raw_fd(),
-            &[IoVec::from_slice(&buf)],
+            &[IoSlice::new(&buf)],
             &[sock::ControlMessage::Ipv4PacketInfo(&pkt_info)],
             sock::MsgFlags::empty(),
-            Some(&sock::SockAddr::new_inet(destination)),
+            Some(&sock::SockaddrIn::from(SocketAddrV4::from(addr))),
         )
         .map_err(nix_to_io_error)
     }
@@ -280,10 +299,11 @@ impl AsyncMulticastSocket {
         // calls, and the multihome functionality relies on receiving that ancillary data,
         // so we have to make this operation async "manually".
         self.socket.readable().await?;
-        let message = self.socket.try_io(Interest::READABLE, || {
+        let io_slice = &mut [IoSliceMut::new(&mut data_buffer)];
+        let message: RecvMsg<sock::SockaddrIn> = self.socket.try_io(Interest::READABLE, || {
             sock::recvmsg(
                 self.socket.as_raw_fd(),
-                &[IoVec::from_mut_slice(&mut data_buffer)],
+                io_slice,
                 Some(&mut control_buffer),
                 sock::MsgFlags::empty(),
             )
@@ -291,11 +311,10 @@ impl AsyncMulticastSocket {
         })?;
 
         let origin_address = match message.address {
-            Some(sock::SockAddr::Inet(v4)) => Some(v4.to_std()),
-            _ => None,
-        };
-        let origin_address = match origin_address {
-            Some(SocketAddr::V4(v4)) => v4,
+            Some(sockaddr) => SocketAddrV4::new(
+                Ipv4Addr::from(sockaddr.ip().to_le()),
+                sockaddr.port().to_le(),
+            ),
             _ => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
         };
 
@@ -307,8 +326,10 @@ impl AsyncMulticastSocket {
             }
         }
 
+        let data_as_vec = data_buffer.to_vec();
+
         Ok(Message {
-            data: data_buffer[0..message.bytes].to_vec(),
+            data: data_as_vec,
             origin_address,
             interface,
         })
@@ -324,11 +345,13 @@ impl AsyncMulticastSocket {
 
         match interface {
             Interface::Default => {}
-            Interface::Ip(address) => pkt_info.ipi_spec_dst = sock::Ipv4Addr::from_std(address).0,
+            Interface::Ip(address) => {
+                pkt_info.ipi_spec_dst = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(address.octets()),
+                }
+            }
             Interface::Index(index) => pkt_info.ipi_ifindex = *index as _,
         };
-
-        let destination = sock::InetAddr::from_std(&addr.into());
 
         // There is no Async API for the UNIX sendmsg/recvmsg vectored scatter-gather
         // calls, and the multihome functionality relies on receiving that ancillary data,
@@ -337,10 +360,10 @@ impl AsyncMulticastSocket {
         self.socket.try_io(Interest::WRITABLE, || {
             sock::sendmsg(
                 self.socket.as_raw_fd(),
-                &[IoVec::from_slice(&buf)],
+                &[IoSlice::new(&buf)],
                 &[sock::ControlMessage::Ipv4PacketInfo(&pkt_info)],
                 sock::MsgFlags::empty(),
-                Some(&sock::SockAddr::new_inet(destination)),
+                Some(&sock::SockaddrIn::from(SocketAddrV4::from(addr))),
             )
             .map_err(nix_to_io_error)
         })

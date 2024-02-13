@@ -1,5 +1,5 @@
 use multicast_socket::MulticastSocket;
-use std::net::SocketAddrV4;
+use std::{net::SocketAddrV4, thread::sleep, time::Duration};
 
 fn main() {
     let mdns_multicast_address = SocketAddrV4::new([224, 0, 0, 251].into(), 5353);
@@ -36,5 +36,6 @@ fn main() {
                 .send(&data, &message.interface)
                 .expect("could not send data");
         };
+        sleep(Duration::from_millis(500))
     }
 }

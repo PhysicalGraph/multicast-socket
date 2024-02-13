@@ -1,5 +1,6 @@
 use multicast_socket::{AsyncMulticastSocket, MulticastSocket};
 use std::{convert::TryInto, net::SocketAddrV4};
+use tokio::time::{sleep, Duration};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -40,5 +41,6 @@ async fn main() {
                 .await
                 .expect("could not send data");
         };
+        sleep(Duration::from_millis(500)).await;
     }
 }
