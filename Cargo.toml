@@ -1,7 +1,7 @@
 [package]
 name = 'multicast-socket'
 description = 'Single-socket multi-interface multicast socket'
-version = "0.5.2"
+version = "0.5.3"
 authors = ['Bruno Tavares <connect+github@bltavares.com>']
 edition = '2021'
 homepage = 'https://github.com/bltavares/multicast-socket'
@@ -15,6 +15,7 @@ default = ["tokio"]
 tokio = ["dep:tokio"]
 
 [dependencies]
+network-interface = "1.1"
 tokio = { optional = true, version = "1.28", features = [
     "net",
     "rt",

@@ -22,7 +22,7 @@ This is less than ideal on computers with multiple interfaces (a.k.a. 'multihome
 
 Instead of creating multiples sockets for each interface, and providing a multi-socket writer, this crate uses a couple of C/C++ OS-specific syscalls and methods to provide a single-socket multi-interface multicast experience.
 
-The create also provides a utility constructor which uses `get_if_addrs` syscalls to find all available interfaces to bind to it, providing an out-of-the-box multicast multihomed experience.
+The create also provides a utility constructor which uses the `network-interface` crate to find all available interfaces to bind to it, providing an out-of-the-box multicast multihomed experience.
 
 The crate is designed with IPv4 in mind because I didn't have a test project to validate what IPv6 needs, and this is why the structs are IPv4 specific. If there is a suggestion on how to test this for IPv6, it could be expanded later.
 
