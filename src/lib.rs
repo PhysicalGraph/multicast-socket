@@ -16,6 +16,7 @@ pub struct MulticastOptions {
     ///
     /// If this is `None`, [`MulticastSocket::receive`] will block until there is data to read.
     pub read_timeout: Option<Duration>,
+    pub nonblocking: bool,
     pub loopback: bool,
     pub buffer_size: usize,
     /// The address to bind the socket to.
@@ -29,6 +30,7 @@ impl Default for MulticastOptions {
     fn default() -> Self {
         MulticastOptions {
             read_timeout: Some(Duration::from_secs(1)),
+            nonblocking: false,
             loopback: true,
             buffer_size: 512,
             bind_address: Ipv4Addr::UNSPECIFIED,

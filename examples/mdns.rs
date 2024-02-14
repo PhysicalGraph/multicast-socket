@@ -16,10 +16,8 @@ fn main() {
     .expect("validate that we are starting with options");
     drop(with_options);
 
-    let mut socket = MulticastSocket::all_interfaces(mdns_multicast_address)
+    let socket = MulticastSocket::all_interfaces(mdns_multicast_address)
         .expect("could not create and bind socket");
-
-    socket.bind().expect("Could not bind");
 
     let data = vec![1, 2];
     socket

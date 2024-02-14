@@ -22,7 +22,10 @@ fn create_on_interfaces(
     multicast_address: SocketAddrV4,
 ) -> io::Result<MulticastSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_read_timeout(options.read_timeout)?;
+    socket.set_nonblocking(options.nonblocking)?;
+    if !options.nonblocking {
+        socket.set_read_timeout(options.read_timeout)?;
+    }
     socket.set_multicast_loop_v4(options.loopback)?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
@@ -34,9 +37,10 @@ fn create_on_interfaces(
         .map_err(nix_to_io_error)?;
 
     for interface in &interfaces {
-        println!("Joining multicast addr {multicast_address:#?} for iface {interface:#?}");
         socket.join_multicast_v4(multicast_address.ip(), &interface)?;
     }
+
+    socket.bind(&SocketAddr::new(options.bind_address.into(), multicast_address.port()).into())?;
 
     Ok(MulticastSocket {
         socket,
@@ -44,7 +48,6 @@ fn create_on_interfaces(
             interfaces,
             multicast_address,
             buffer_size: options.buffer_size,
-            options: Some(options),
         },
     })
 }
@@ -53,7 +56,6 @@ struct MulticastSocketInner {
     interfaces: Vec<Ipv4Addr>,
     multicast_address: SocketAddrV4,
     buffer_size: usize,
-    options: Option<crate::MulticastOptions>,
 }
 
 pub struct MulticastSocket {
@@ -161,20 +163,6 @@ fn nix_to_io_error(e: nix::Error) -> io::Error {
 }
 
 impl MulticastSocket {
-    pub fn bind(&mut self) -> io::Result<()> {
-        let options =
-            self.inner.options.take().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::AlreadyExists, "Socket already bound")
-            })?;
-        self.socket.bind(
-            &SocketAddr::new(
-                options.bind_address.into(),
-                self.inner.multicast_address.port(),
-            )
-            .into(),
-        )
-    }
-
     pub fn receive(&self) -> io::Result<Message> {
         let mut data_buffer = vec![0; self.inner.buffer_size];
         let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
@@ -204,10 +192,15 @@ impl MulticastSocket {
             }
         }
 
-        let data_as_vec = data_buffer.to_vec();
-
+        // Weird borrow interaction here because of the mutable borrow that
+        // goes in to the IoSlice, so it's time to bust out the good old fashioned
+        // for loop.
+        let mut data = Vec::with_capacity(message.bytes);
+        for i in 0..message.bytes {
+            data.insert(i, data_buffer[i]);
+        }
         Ok(Message {
-            data: data_as_vec,
+            data,
             origin_address,
             interface,
         })
@@ -247,7 +240,6 @@ impl MulticastSocket {
 
     pub fn broadcast_to(&self, buf: &[u8], addr: SocketAddrV4) -> io::Result<()> {
         for interface in &self.inner.interfaces {
-            println!("Sending to interface {interface:#?}");
             self.send_to(buf, &Interface::Ip(*interface), addr)?;
         }
         Ok(())
@@ -271,17 +263,9 @@ pub struct AsyncMulticastSocket {
 impl TryFrom<MulticastSocket> for AsyncMulticastSocket {
     type Error = io::Error;
 
-    fn try_from(value: MulticastSocket) -> Result<Self, Self::Error> {
-        let mut other = value;
-        other.inner.options = other.inner.options.map(|mut opts| {
-            opts.read_timeout = None;
-            opts
-        });
+    fn try_from(other: MulticastSocket) -> Result<Self, Self::Error> {
         other.socket.set_nonblocking(true)?;
-        other.bind()?;
-
         let sock = tokio::net::UdpSocket::from_std(other.socket.into())?;
-
         Ok(Self {
             socket: sock,
             inner: other.inner,
@@ -326,10 +310,15 @@ impl AsyncMulticastSocket {
             }
         }
 
-        let data_as_vec = data_buffer.to_vec();
-
+        // Weird borrow interaction here because of the mutable borrow that
+        // goes in to the IoSlice, so it's time to bust out the good old fashioned
+        // for loop.
+        let mut data = Vec::with_capacity(message.bytes);
+        for i in 0..message.bytes {
+            data.insert(i, data_buffer[i]);
+        }
         Ok(Message {
-            data: data_as_vec,
+            data,
             origin_address,
             interface,
         })
@@ -375,7 +364,6 @@ impl AsyncMulticastSocket {
 
     pub async fn broadcast_to(&self, buf: &[u8], addr: SocketAddrV4) -> io::Result<()> {
         for interface in &self.inner.interfaces {
-            println!("Sending to interface {interface:#?}");
             self.send_to(buf, &Interface::Ip(*interface), addr).await?;
         }
         Ok(())
