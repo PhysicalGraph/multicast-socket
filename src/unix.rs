@@ -158,7 +158,10 @@ impl MulticastSocket {
 }
 
 fn nix_to_io_error(e: nix::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
+    match e {
+        nix::errno::Errno::EAGAIN => io::ErrorKind::WouldBlock.into(),
+        _ => io::Error::new(io::ErrorKind::Other, e),
+    }
 }
 
 impl MulticastSocket {
@@ -276,51 +279,51 @@ impl TryFrom<MulticastSocket> for AsyncMulticastSocket {
 impl AsyncMulticastSocket {
     pub async fn receive(&self) -> io::Result<Message> {
         let mut data_buffer = vec![0; self.inner.buffer_size];
-        let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
 
         // There is no Async API for the UNIX sendmsg/recvmsg vectored scatter-gather
         // calls, and the multihome functionality relies on receiving that ancillary data,
         // so we have to make this operation async "manually".
-        self.socket.readable().await?;
-        let io_slice = &mut [IoSliceMut::new(&mut data_buffer)];
-        let message: RecvMsg<sock::SockaddrIn> = self.socket.try_io(Interest::READABLE, || {
-            sock::recvmsg(
+        self.socket.async_io(Interest::READABLE, || {
+            let io_slice = &mut [IoSliceMut::new(&mut data_buffer)];
+            let mut control_buffer = nix::cmsg_space!(libc::in_pktinfo);
+            let message: RecvMsg<sock::SockaddrIn> = sock::recvmsg(
                 self.socket.as_raw_fd(),
                 io_slice,
                 Some(&mut control_buffer),
                 sock::MsgFlags::empty(),
             )
-            .map_err(nix_to_io_error)
-        })?;
+            .map_err(nix_to_io_error)?;
 
-        let origin_address = match message.address {
-            Some(sockaddr) => SocketAddrV4::new(
-                Ipv4Addr::from(sockaddr.ip().to_le()),
-                sockaddr.port().to_le(),
-            ),
-            _ => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-        };
+            let origin_address = match message.address {
+                Some(sockaddr) => SocketAddrV4::new(
+                    Ipv4Addr::from(sockaddr.ip().to_le()),
+                    sockaddr.port().to_le(),
+                ),
+                _ => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            };
 
-        let mut interface = Interface::Default;
+            let mut interface = Interface::Default;
 
-        for cmsg in message.cmsgs() {
-            if let sock::ControlMessageOwned::Ipv4PacketInfo(pktinfo) = cmsg {
-                interface = Interface::Index(pktinfo.ipi_ifindex as _);
+            for cmsg in message.cmsgs() {
+                if let sock::ControlMessageOwned::Ipv4PacketInfo(pktinfo) = cmsg {
+                    interface = Interface::Index(pktinfo.ipi_ifindex as _);
+                }
             }
-        }
 
-        // Weird borrow interaction here because of the mutable borrow that
-        // goes in to the IoSlice, so it's time to bust out the good old fashioned
-        // for loop.
-        let mut data = Vec::with_capacity(message.bytes);
-        for i in 0..message.bytes {
-            data.insert(i, data_buffer[i]);
-        }
-        Ok(Message {
-            data,
-            origin_address,
-            interface,
-        })
+            // Weird borrow interaction here because of the mutable borrow that
+            // goes in to the IoSlice, so it's time to bust out the good old fashioned
+            // for loop.
+            let mut data = Vec::with_capacity(message.bytes);
+            for i in 0..message.bytes {
+                data.insert(i, data_buffer[i]);
+            }
+
+            Ok(Message {
+                data,
+                origin_address,
+                interface,
+            })
+        }).await
     }
 
     pub async fn send_to(
@@ -344,8 +347,7 @@ impl AsyncMulticastSocket {
         // There is no Async API for the UNIX sendmsg/recvmsg vectored scatter-gather
         // calls, and the multihome functionality relies on receiving that ancillary data,
         // so we have to make this operation async "manually".
-        self.socket.writable().await?;
-        self.socket.try_io(Interest::WRITABLE, || {
+        self.socket.async_io(Interest::WRITABLE, || {
             sock::sendmsg(
                 self.socket.as_raw_fd(),
                 &[IoSlice::new(&buf)],
@@ -354,7 +356,7 @@ impl AsyncMulticastSocket {
                 Some(&sock::SockaddrIn::from(SocketAddrV4::from(addr))),
             )
             .map_err(nix_to_io_error)
-        })
+        }).await
     }
     pub async fn send(&self, buf: &[u8], interface: &Interface) -> io::Result<usize> {
         self.send_to(buf, interface, self.inner.multicast_address)
