@@ -9,8 +9,6 @@ use nix::net::if_::InterfaceFlags;
 use socket2::{Domain, Protocol, Socket, Type};
 
 #[cfg(feature = "tokio")]
-use std::convert::TryFrom;
-#[cfg(feature = "tokio")]
 use tokio::io::Interest;
 
 use nix::sys::socket::{self as sock, RecvMsg};
@@ -119,11 +117,7 @@ pub fn all_ipv4_interfaces() -> io::Result<Vec<Ipv4Addr>> {
     // We have to filter the same interface if it has multiple ips
     // https://stackoverflow.com/questions/49819010/ip-add-membership-fails-when-set-both-on-interface-and-its-subinterface-is-that
     let (lower_bound, upper_bound) = interfaces.size_hint();
-    let reserved_capacity = if let Some(bound) = upper_bound {
-        bound
-    } else {
-        lower_bound
-    };
+    let reserved_capacity = upper_bound.unwrap_or(lower_bound);
     let mut collected_interfaces = HashMap::with_capacity(reserved_capacity);
     for interface in interfaces {
         if !collected_interfaces.contains_key(&interface.interface_name) {
@@ -199,7 +193,7 @@ impl MulticastSocket {
         // for loop.
         let mut data = Vec::with_capacity(message.bytes);
         for i in 0..message.bytes {
-            data.insert(i, data_buffer[i]);
+            data.push(data_buffer[i]);
         }
         Ok(Message {
             data,
@@ -315,7 +309,7 @@ impl AsyncMulticastSocket {
             // for loop.
             let mut data = Vec::with_capacity(message.bytes);
             for i in 0..message.bytes {
-                data.insert(i, data_buffer[i]);
+                data.push(data_buffer[i]);
             }
 
             Ok(Message {

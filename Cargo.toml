@@ -1,9 +1,9 @@
 [package]
 name = 'multicast-socket'
 description = 'Single-socket multi-interface multicast socket'
-version = "0.5.1"
+version = "0.5.2"
 authors = ['Bruno Tavares <connect+github@bltavares.com>']
-edition = '2018'
+edition = '2021'
 homepage = 'https://github.com/bltavares/multicast-socket'
 repository = 'https://github.com/bltavares/multicast-socket'
 readme = 'README.md'
@@ -11,7 +11,7 @@ license = 'MIT OR Apache-2.0'
 keywords = ['multicast']
 
 [features]
-default = []
+default = ["tokio"]
 tokio = ["dep:tokio"]
 
 [dependencies]
